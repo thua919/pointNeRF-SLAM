@@ -4,4 +4,5 @@ mapping:
   marching_cubes_bound: [[-2.9,8.9],[-3.2,5.5],[-3.5,3.3]]
 data:
   input_folder: /home/ps/data/tongyanhua/Datasets/Replica/room0
-  output: output_pointNeRF_SLAM/Replica/room0-debug
+  output: output_pointNeRF_SLAM/Replica/rom0-debug
+#room0-GTpose-NoDepth-BA-dynamic-ReplicaYaml

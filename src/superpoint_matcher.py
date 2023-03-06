@@ -214,7 +214,9 @@ class FlannFeatureMatcher(FeatureMatcher):
             # FLANN parameters for float descriptors 
             FLANN_INDEX_KDTREE = 1
             self.index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 4)  
-        self.search_params = dict(checks=32)   # or pass empty dictionary                 
-        self.matcher = cv2.FlannBasedMatcher(self.index_params, self.search_params)  
+        self.search_params = dict(checks=32)   # or pass empty dictionary
+        # ========================================================================= #                 
+        self.matcher = cv2.FlannBasedMatcher(self.index_params, self.search_params)
+        # ========================================================================= #  
         self.matcher_name = 'FlannFeatureMatcher'                                                
 

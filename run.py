@@ -9,7 +9,7 @@ from src.NICE_SLAM import NICE_SLAM
 import torch
 
 # 限制0号设备的显存的使用量为0.5，就是半张卡那么多，比如12G卡，设置0.5就是6G。
-torch.cuda.set_per_process_memory_fraction(0.99, 5)
+#torch.cuda.set_per_process_memory_fraction(0.99, 5)
 torch.cuda.empty_cache()
 
 

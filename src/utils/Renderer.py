@@ -85,8 +85,8 @@ class Renderer(object):
 
         N_rays = rays_o.shape[0]
 
-        if stage == 'coarse':
-            gt_depth = None
+        #if stage == 'coarse':
+        #    gt_depth = None
         if gt_depth is None:
             N_surface = 0
             near = 0.01
@@ -106,7 +106,12 @@ class Renderer(object):
 
         if gt_depth is not None:
             # in case the bound is too large
-            far = torch.clamp(far_bb, 0,  torch.max(gt_depth*1.2))
+            '''max_t=torch.max(gt_depth*1.2,0).values
+            max=float(max_t)'''
+            #print("============= torch.numel(gt_depth) ===============: ",torch.numel(gt_depth))
+            far = torch.clamp(far_bb, 0, (gt_depth*1.2).max())
+            #far = torch.clamp(far_bb, 0,  torch.max(gt_depth*1.2))
+            #far = torch.clamp(far_bb, 0, max)
         else:
             far = far_bb
         if N_surface > 0:

@@ -1,12 +1,14 @@
 import os
-import time
-
+import time, threading
+rlock = threading.RLock()
 import numpy as np
 import torch
 import torch.multiprocessing
 import torch.multiprocessing as mp
+from collections import deque
 
 from src import config
+from src.frame import Frame
 from src.Mapper import Mapper
 from src.Tracker import Tracker
 from src.utils.datasets import get_dataset
@@ -14,9 +16,12 @@ from src.utils.Logger import Logger
 from src.utils.Mesher import Mesher
 from src.utils.Renderer import Renderer
 
+#from src.map import Map
+
 torch.multiprocessing.set_sharing_strategy('file_system')
 from src.camera import PinholeCamera
 
+kMaxLenFrameDeque = 20
 
 class NICE_SLAM():
     """
@@ -35,6 +40,31 @@ class NICE_SLAM():
         self.depth_supervision= cfg['depth_supervision']
         self.bundle_loss=cfg['bundle_loss']
         self.fps=20
+        
+        self.frames = deque(maxlen=kMaxLenFrameDeque)
+        self.pseudo_depth_maps = deque(maxlen=kMaxLenFrameDeque)
+        
+        self.f_cur = None 
+        self.idxs_cur = None 
+        self.f_ref = None 
+        self.idxs_ref = None
+        #self.map = Map()
+        #self.local_mapping = LocalMapping(self.map) 
+        
+        self.depth_coord_cur=None
+        self.depth_coord_ref=None
+        self.depth_cur=None
+        self.depth_ref=None
+        
+        self.depth_cur_weak=None
+        self.depth_ref_weak=None
+        
+        self.bundle_loss=cfg['bundle_loss']
+        self.depth_cur_gt=None
+        
+        self.init_finished = False
+        self.mapper_finished = False
+        self.idx0=torch.zeros((1)).int()[0]  
         #=====================================================#
 
         self.coarse = cfg['coarse']
@@ -51,6 +81,9 @@ class NICE_SLAM():
         os.makedirs(self.output, exist_ok=True)
         os.makedirs(self.ckptsdir, exist_ok=True)
         os.makedirs(f'{self.output}/mesh', exist_ok=True)
+        
+        os.makedirs(f'{self.output}/pseudo_depth', exist_ok=True)
+        
         self.H, self.W, self.fx, self.fy, self.cx, self.cy = cfg['cam']['H'], cfg['cam'][
             'W'], cfg['cam']['fx'], cfg['cam']['fy'], cfg['cam']['cx'], cfg['cam']['cy']
         self.update_cam()
@@ -94,8 +127,16 @@ class NICE_SLAM():
 
         self.gt_c2w_list = torch.zeros((self.n_img, 4, 4))
         self.gt_c2w_list.share_memory_()
+        
+        
         self.idx = torch.zeros((1)).int()
         self.idx.share_memory_()
+        
+        self.depth_cur_weak=torch.zeros((self.H,self.W))
+        self.depth_cur_weak.share_memory_()
+        self.depth_ref_weak=torch.zeros((self.H,self.W))
+        self.depth_ref_weak.share_memory_()
+        
         self.mapping_first_frame = torch.zeros((1)).int()
         self.mapping_first_frame.share_memory_()
         # the id of the newest frame Mapper is processing
@@ -277,24 +318,22 @@ class NICE_SLAM():
     def tracking(self, rank):
         """
         Tracking Thread.
-
         Args:
             rank (int): Thread ID.
         """
 
         # should wait until the mapping of first frame is finished
         # Tracking线程在mapping完第一帧才开始启动
-        while (1):
-            if self.mapping_first_frame[0] == 1:
+        '''while (1):
+            if not self.init_finished and self.idx:
                 break
-            time.sleep(1)
+            time.sleep(1)'''
 
         self.tracker.run()
 
     def mapping(self, rank):
         """
         Mapping Thread. (updates middle, fine, and color level)
-
         Args:
             rank (int): Thread ID.
         """

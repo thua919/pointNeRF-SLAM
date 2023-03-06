@@ -8,9 +8,9 @@ tracking:
   ignore_edge_H: 100
   seperate_LR: False
   const_speed_assumption: True
-  lr: 0.001
-  pixels: 200
-  iters: 10
+  lr: 0.001 #imap 0.0005
+  pixels: 200 #imap 5000
+  iters: 10 #imap 50
 mapping:
   every_frame: 5
   vis_freq: 50
@@ -19,9 +19,9 @@ mapping:
   ckpt_freq: 500
   keyframe_every: 50
   mapping_window_size: 5
-  pixels: 1000
+  pixels: 1000 #imap 5000
   iters_first: 1500
-  iters: 60
+  iters: 60 #imap 300
 cam:
   H: 680
   W: 1200

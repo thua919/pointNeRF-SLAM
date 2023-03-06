@@ -165,26 +165,47 @@ def triangulate_points_with_mask(pose1, pose2, pts1, pts2, mask):
 
 
 def triangulate_normalized_points(pose_1w, pose_2w, kpn_1, kpn_2):
+    # triangulate_normalized_points(kf_cur.Tcw, kf_ref.Tcw, kf_cur.kpsn[idx_cur_inliers], kf_ref.kpsn[idx_ref_inliers])
+    # kpsn：经过相机投影矩阵归一化的相机坐标系下的关键点
+    
     # P1w = np.dot(K1,  M1w) # K1*[R1w, t1w]
     # P2w = np.dot(K2,  M2w) # K2*[R2w, t2w]
     # since we are working with normalized coordinates x_hat = Kinv*x, one has         
     P1w = pose_1w[:3,:] # [R1w, t1w]
+    R1w=P1w[:,:3]
+    t1w=P1w[:,3]
+    Rcw1 = R1w[2,:3]  # just 2-nd row 
+    tcw1 = t1w[2]   # just 2-nd row 
+    
     P2w = pose_2w[:3,:] # [R2w, t2w]
-
+    R2w=P2w[:,:3]
+    t2w=P2w[:,3]
+    Rcw2 = R2w[2,:3]  # just 2-nd row 
+    tcw2 = t2w[2]   # just 2-nd row
+      
     point_4d_hom = cv2.triangulatePoints(P1w, P2w, kpn_1.T, kpn_2.T)
     good_pts_mask = np.where(point_4d_hom[3]!= 0)[0]
-    point_4d = point_4d_hom / point_4d_hom[3] 
+    point_4d = point_4d_hom / point_4d_hom[3]
     
-    if __debug__:
-        if False: 
-            point_reproj = P1w @ point_4d;
-            point_reproj = point_reproj / point_reproj[2] - add_ones(kpn_1).T
-            err = np.sum(point_reproj**2)
-            print('reproj err: ', err)     
+    if True:
+        point_reproj_to_cur = P1w @ point_4d
+        point_reproj_to_ref = P2w @ point_4d  
+        point_reproj_to_cur = point_reproj_to_cur / point_reproj_to_cur[2] - add_ones(kpn_1).T
+        point_reproj_to_ref = point_reproj_to_ref / point_reproj_to_ref[2] - add_ones(kpn_2).T
+        err_to_cur = np.sum(point_reproj_to_cur**2)
+        err_to_ref = np.sum(point_reproj_to_ref**2) 
+        print('reproj err to cur while triangulation : ', err_to_cur)
+        print('reproj err to ref while triangulation : ', err_to_ref)
+    points_3d = point_4d[:3, :].T
+    
+    '''if err_to_cur<0.1 and err_to_ref<0.1:
+        z1 = np.dot(Rcw1, points_3d[:,:3].T) + tcw1  
+        z2 = np.dot(Rcw2, points_3d[:,:3].T) + tcw2'''   
 
     #return point_4d.T
     points_3d = point_4d[:3, :].T
-    return points_3d, good_pts_mask  
+    return points_3d, good_pts_mask
+
 
 
 # compute the fundamental mat F12 and the infinite homography H21 [Hartley Zisserman pag 339]

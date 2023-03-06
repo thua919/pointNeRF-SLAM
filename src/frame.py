@@ -25,8 +25,12 @@ from scipy.spatial import cKDTree
 
 from src.camera_pose import CameraPose
 #from utils_geom import add_ones, poseRt, normalize
-#from utils_sys import myjet, Printer
-#from parameters import Parameters  
+from src.utils.utils_sys import myjet, Printer,is_opencv_version_greater_equal
+
+#from parameters import Parameters
+#from src.superpoint_tracker import SuperpointTracker
+from src.demo_superpoint import SuperPointFrontend
+  
 
 myjet = np.array([[0.        , 0.        , 0.5       ],
                   [0.        , 0.        , 0.99910873],
@@ -43,6 +47,7 @@ myjet = np.array([[0.        , 0.        , 0.5       ],
 kDrawFeatureRadius = [r*5 for r in range(1,100)]
 kDrawOctaveColor = np.linspace(0, 255, 12)
 kViewingCosLimitForPoint=0.5
+kNumFeatures=3000
 
 
 # Base object class for frame info management; 
@@ -250,19 +255,31 @@ class FrameBase(object):
 
 # A Frame mainly collects keypoints, descriptors and their corresponding 3D points 
 class Frame(FrameBase):
-    tracker         = None      # shared tracker  
-    feature_manager = None 
-    feature_matcher = None 
-    descriptor_distance = None       
-    descriptor_distances = None  # norm for vectors     
-    is_store_imgs = False         
+    '''
+    tracker         = SuperpointTracker()      # shared tracker  
+    feature_manager = tracker.feature_manager 
+    feature_matcher = tracker.matcher
+    descriptor_distance = tracker.descriptor_distance      
+    descriptor_distances = tracker.descriptor_distances     
+    oriented_features = tracker.feature_manager.oriented_features
+    _id = 0    
+    '''
+    
+    is_store_imgs = True
     def __init__(self, img, camera, pose=None, id=None, timestamp=None, kps_data=None):
-        super().__init__(camera, pose, id, timestamp)    
+        super().__init__(camera, pose, id, timestamp)
+        self.fe = SuperPointFrontend(weights_path='pretrained/superpoint_v1.pth',
+                                nms_dist=4,
+                                conf_thresh=0.015,
+                                nn_thresh=0.7,
+                                cuda=True)
+        
+        #self.tracker = PointTracker(max_length=2, nn_thresh=0.7)
         
         self._lock_features = RLock()  
-                
-        self.is_keyframe = False  
+        self.is_keyframe = False 
 
+        
         # image keypoints information arrays (unpacked from array of cv::KeyPoint())
         self.kps     = None      # keypoint coordinates                  [Nx2]
         self.kpsu    = None      # [u]ndistorted keypoint coordinates    [Nx2]
@@ -271,12 +288,19 @@ class Frame(FrameBase):
         self.sizes   = None      # keypoint sizes                        [Nx1] 
         self.angles  = None      # keypoint sizes                        [Nx1]         
         self.des     = None      # keypoint descriptors                  [NxD] where D is the descriptor length 
-
+        
+        # image superpoint infomation arrays
+        self.super_pts = []        
+        self.super_des = []
+        self.heatmap = [] 
+        
         # map points information arrays 
         self.points   = None      # map points => self.points[idx] (if is not None) is the map point matched with self.kps[idx]
         self.outliers = None      # outliers flags for map points (reset and set by pose_optimization())
-        
         self.kf_ref = None        # reference keyframe 
+        
+        # 传到主线程里去可视化看看
+        self.tracks= None
 
         if img is not None:
             #self.H, self.W = img.shape[0:2]                 
@@ -284,8 +308,28 @@ class Frame(FrameBase):
                 self.img = img.copy()  
             else: 
                 self.img = None                    
-            if kps_data is None:   
-                self.kps, self.des = Frame.tracker.detectAndCompute(img)                                                         
+            if kps_data is None:
+                
+                # ====================================================== #
+                # 这一段完成了原来 self.kps, self.des = Frame.tracker.detectAndCompute(img) 的功能
+                with self._lock_features:
+                    self.imgFloat  = (img.astype('float32') / 255.)
+                    self.super_pts, self.super_des, self.heatmap = self.fe.run(self.imgFloat)
+                    print('==> Successfully inferencing on this frame.')
+                    self.kps = convert_superpts_to_keypoints(self.super_pts.T, size=40) #size 只是原生画图点大小
+                    des=self.super_des
+                    self.des=des.T
+                    
+                    # ====================================================== #    
+                    # 这一段是demo_superpoint.py自己用来记录追踪点并用来可视化的逻辑    
+                    # Add points and descriptors to the tracker.
+                    #self.tracker.update(self.super_pts, self.super_des)
+                    # Get tracks for points which were match successfully across all frames.
+                    #if self.timestamp>0:
+                    #    self.tracks = self.tracker.get_tracks(min_length=2)
+                    #    print(self.tracks)
+                    # ====================================================== #
+                
                 # convert from a list of keypoints to arrays of points, octaves, sizes  
                 kps_data = np.array([ [x.pt[0], x.pt[1], x.octave, x.size, x.angle] for x in self.kps ], dtype=np.float32)                            
                 self.kps     = kps_data[:,:2]    
@@ -301,14 +345,17 @@ class Frame(FrameBase):
             self.points = np.array( [None]*len(self.kpsu) )  # init map points
             self.outliers = np.full(self.kpsu.shape[0], False, dtype=bool)
             
+    
+    
+    
     @staticmethod
     def set_tracker(tracker):
-        Frame.tracker = tracker 
-        Frame.feature_manager = tracker.feature_manager 
-        Frame.feature_matcher = tracker.matcher
-        Frame.descriptor_distance  = tracker.descriptor_distance       
-        Frame.descriptor_distances = tracker.descriptor_distances        
-        Frame.oriented_features = tracker.feature_manager.oriented_features
+        #Frame.tracker = tracker 
+        #Frame.feature_manager = tracker.feature_manager 
+        #Frame.feature_matcher = cv2.FlannBasedMatcher(index_params, search_params)
+        #Frame.descriptor_distance  = tracker.descriptor_distance       
+        #Frame.descriptor_distances = tracker.descriptor_distances        
+        #Frame.oriented_features = tracker.feature_manager.oriented_features
         Frame._id = 0           
      
     # KD tree of undistorted keypoints
@@ -482,8 +529,8 @@ class Frame(FrameBase):
             return z[ ( len(z)-1)//2 ]                
         else:
             Printer.red('frame.compute_points_median_depth() with no points')
-            return -1 
-        
+            return -1
+ 
     # draw tracked features on the image for selected keypoint indexes 
     def draw_feature_trails(self, img, kps_idxs, trail_max_length=9):
         img = img.copy()
@@ -531,8 +578,15 @@ class Frame(FrameBase):
 
 # match frames f1 and f2
 # out: a vector of match index pairs [idx1[i],idx2[i]] such that the keypoint f1.kps[idx1[i]] is matched with f2.kps[idx2[i]]
-def match_frames(f1, f2, ratio_test=None):     
-    idx1, idx2 = Frame.feature_matcher.match(f1.des, f2.des, ratio_test)
-    idx1 = np.asarray(idx1)
-    idx2 = np.asarray(idx2)   
-    return idx1, idx2         
+
+
+def convert_superpts_to_keypoints(pts, size=1): 
+        kps = []
+        if pts is not None: 
+            # convert matrix [Nx2] of pts into list of keypoints  
+            if is_opencv_version_greater_equal(4,5,3):
+                kps = [ cv2.KeyPoint(p[0], p[1], size=size, response=p[2]) for p in pts ]            
+            else: 
+                kps = [ cv2.KeyPoint(p[0], p[1], _size=size, _response=p[2]) for p in pts ]                      
+        return kps
+    

@@ -19,10 +19,12 @@
 
 import numpy as np 
 from enum import Enum
-#import cv2
+import cv2
 
 from src.superpoint_manager import SuperpointManager
+from src.feature_superpoint import SuperPointFeature2D 
 from src.superpoint_matcher import feature_matcher_factory, FeatureMatcherTypes
+from src.utils.utils_features import sat_num_features, kdt_nms, ssc_nms, octree_nms, grid_nms
 
 #from utils_sys import Printer, import_from
 #from utils_geom import hamming_distance, hamming_distances, l2_distance, l2_distances
@@ -33,7 +35,7 @@ from src.superpoint_matcher import feature_matcher_factory, FeatureMatcherTypes
 kMinNumFeatureDefault = 2000
 kLkPyrOpticFlowNumLevelsMin = 3   # maximal pyramid level number for LK optic flow 
 kRatioTest = 0.7
-
+feature_detector = SuperPointFeature2D()
 
 class FeatureTrackerTypes():
     LK        = 0   # Lucas Kanade pyramid optic flow (use pixel patch as "descriptor" and matching by optimization)
@@ -42,12 +44,20 @@ class FeatureTrackerTypes():
 
 class FeatureDetectorTypes():   
     NONE        = 0 
-    SUPERPOINT  = 11  # [end-to-end] joint detector-descriptor - "SuperPoint: Self-Supervised Interest Point Detection and Description"
+    SUPERPOINT  = 1  # [end-to-end] joint detector-descriptor - "SuperPoint: Self-Supervised Interest Point Detection and Description"
 
 class FeatureDescriptorTypes():
     NONE        = 0 
-    SUPERPOINT  = 10  # [end-to-end] only with SUPERPOINT detector - "SuperPoint: Self-Supervised Interest Point Detection and Description"
+    SUPERPOINT  = 1  # [end-to-end] only with SUPERPOINT detector - "SuperPoint: Self-Supervised Interest Point Detection and Description"
 
+class KeyPointFilterTypes(Enum):
+    NONE         = 0
+    SAT          = 1      # sat the number of features (keep the best N features: 'best' on the basis of the keypoint.response)
+    KDT_NMS      = 2      # Non-Maxima Suppression based on kd-tree
+    SSC_NMS      = 3      # Non-Maxima Suppression based on https://github.com/BAILOOL/ANMS-Codes
+    OCTREE_NMS   = 4      # Distribute keypoints by using a octree (as a matter of fact, a quadtree): from ORBSLAM2
+    GRID_NMS     = 5      # NMS by using a grid 
+    
 FeatureTrackerTypes=FeatureTrackerTypes()
 FeatureDetectorTypes=FeatureDetectorTypes()
 FeatureDescriptorTypes=FeatureDescriptorTypes()
@@ -82,40 +92,32 @@ class FeatureTracker(object):
     @property
     def num_features(self):
         return self.feature_manager.num_features
-    
     @property
     def num_levels(self):
-        return self.feature_manager.num_levels    
-    
+        return self.feature_manager.num_levels      
     @property
     def scale_factor(self):
         return self.feature_manager.scale_factor    
-    
     @property
     def norm_type(self):
         return self.feature_manager.norm_type       
-    
     @property
     def descriptor_distance(self):
         return self.feature_manager.descriptor_distance               
-    
     @property
     def descriptor_distances(self):
         return self.feature_manager.descriptor_distances               
-    
     # out: keypoints and descriptors 
     def detectAndCompute(self, frame, mask): 
         return None, None 
-
     # out: FeatureTrackingResult()
     def track(self, image_ref, image_cur, kps_ref, des_ref):
         return FeatureTrackingResult()             
 
-
 # Extract features by using desired detector and descriptor, match keypoints by using desired matcher on computed descriptors
 class SuperpointTracker(FeatureTracker): 
     def __init__(self, num_features=kMinNumFeatureDefault, 
-                       num_levels = 1,                                    # number of pyramid levels for detector  
+                       num_levels = 1,                                    # number of pyramid levels for detector 
                        scale_factor = 1.2,                                # detection scale factor (if it can be set, otherwise it is automatically computed)                
                        detector_type = FeatureDetectorTypes.SUPERPOINT, 
                        descriptor_type = FeatureDescriptorTypes.SUPERPOINT,
@@ -133,35 +135,96 @@ class SuperpointTracker(FeatureTracker):
                                                        scale_factor=scale_factor, 
                                                        detector_type=detector_type, 
                                                        descriptor_type=descriptor_type)                     
-
-        if tracker_type == FeatureTrackerTypes.DES_FLANN:
+        self.keypoint_filter_type = KeyPointFilterTypes.SAT            # default keypoint-filter type
+        self.keypoint_nms_filter_type = KeyPointFilterTypes.KDT_NMS    # default keypoint-filter type if NMS is needed 
+    
+        if tracker_type == FeatureTrackerTypes.DES_FLANN: # 我们写的初始化就是这个
             self.matching_algo = FeatureMatcherTypes.FLANN
         elif tracker_type == FeatureTrackerTypes.DES_BF:
             self.matching_algo = FeatureMatcherTypes.BF
         else:
             raise ValueError("Unmanaged matching algo for feature tracker %s" % self.tracker_type)                   
                     
-        # init matcher 
+        # init matcher 返回了FlannFeatureMatcher
         self.matcher = feature_matcher_factory(norm_type=self.norm_type, # cv2.NORM_L2()
                                                ratio_test=match_ratio_test, # 0.7
                                                type=self.matching_algo)   # FeatureMatcherTypes.FLANN    
+    
+    def filter_keypoints(self, type, frame, kps, des=None):
+        filter_name = type.name
+        if type == KeyPointFilterTypes.SAT: # default keypoint-filter type                                                        
+            if len(kps) > self.num_features:
+                kps, des = sat_num_features(kps, des, self.num_features)
+                 
+        elif type == KeyPointFilterTypes.NONE:
+            pass  
+        elif type == KeyPointFilterTypes.KDT_NMS:      
+            kps, des = kdt_nms(kps, des, self.num_features)
+        elif type == KeyPointFilterTypes.SSC_NMS:    
+            kps, des = ssc_nms(kps, des, frame.shape[1], frame.shape[0], self.num_features)   
+        elif type == KeyPointFilterTypes.OCTREE_NMS:
+            if des is not None: 
+                raise ValueError('at the present time, you cannot use OCTREE_NMS with descriptors')
+            kps = octree_nms(frame, kps, self.num_features)
+        elif type == KeyPointFilterTypes.GRID_NMS:    
+            kps, des, _ = grid_nms(kps, des, frame.shape[0], frame.shape[1], self.num_features, dist_thresh=4)            
+            kps, des, _ = grid_nms(kps, des, frame.shape[0], frame.shape[1], self.num_features, dist_thresh=4)            
+        elif type == KeyPointFilterTypes.SAT:                                                        
+            if len(kps) > self.num_features:
+                kps, des = sat_num_features(kps, des, self.num_features)      
+            kps, des, _ = grid_nms(kps, des, frame.shape[0], frame.shape[1], self.num_features, dist_thresh=4)               
+        elif type == KeyPointFilterTypes.SAT:                                                        
+            if len(kps) > self.num_features:
+                kps, des = sat_num_features(kps, des, self.num_features)      
+        else:             
+            raise ValueError("Unknown match-filter type")
+                 
+        return kps, des, filter_name 
 
 
-    # out: keypoints and descriptors 
-    def detectAndCompute(self, frame, mask=None):
-        return self.feature_manager.detectAndCompute(frame, mask) 
+    # out: keypoints and descriptors 用的是feature_superpoint 里边的detectAndComput
+    def detectAndCompute(self, frame, mask=None, filter = True):
+        if frame.ndim>2:     # check if we have to convert to gray image 
+            frame = cv2.cvtColor(frame,cv2.COLOR_RGB2GRAY)
+        # ================= 用的是  feature_superpoint.py中的 detectAndCompute ============================= #
+        kps, des = feature_detector.detectAndCompute(frame,mask)
+        # ================================================================================================= # 
+        print('detector = descriptor?:', self.detector_type==self.descriptor_type,', #features detected:',len(kps))           
+        filter_name = 'NONE'
+        
+        if filter:                                                                 
+            kps, des, filter_name  = self.filter_keypoints(self.keypoint_filter_type, frame, kps, des)
+            kps, des, filter_name  = self.filter_keypoints(self.keypoint_filter_type, frame, kps, des)           
+            kps, des, filter_name  = self.filter_keypoints(self.keypoint_filter_type, frame, kps, des)             
 
+        print('filter_name is: ',filter_name,
+            ', #features detected after keypoint filter:', 
+                  len(kps),' (#original expected keypoints', self.num_features, '), [keypoint filter type:',filter_name,']')                                         
+        return kps, des 
+        
+    
+    #def detectAndCompute(self, frame): 
+    #    return self.feature_manager.detectAndCompute(frame) 
 
+    '''
     # out: FeatureTrackingResult()
     def track(self, image_ref, image_cur, kps_ref, des_ref):
-        kps_cur, des_cur = self.detectAndCompute(image_cur)
+        # ============================================================= #
+        # feature_superpoint 里边的detectAndComput,同时还返回了heatmap，可以用用看！
+        kps_cur, des_cur= self.detectAndCompute(image_cur)
+        # ============================================================= #
+        
         # convert from list of keypoints to an array of points 
         kps_cur = np.array([x.pt for x in kps_cur], dtype=np.float32) 
-    
-        idxs_ref, idxs_cur = self.matcher.match(des_ref, des_cur)  #knnMatch(queryDescriptors,trainDescriptors)
-        #print('num matches: ', len(matches))
+        
+        # ============================================================= #
+        # 用了superpoint_matcher.py 中的 cv2.FlannBasedMatcher
+        idxs_ref, idxs_cur = self.matcher.match(des_ref, des_cur)
+        # ============================================================= #
 
         res = FeatureTrackingResult()
+
+        
         res.kps_ref = kps_ref  # all the reference keypoints  
         res.kps_cur = kps_cur  # all the current keypoints       
         res.des_cur = des_cur  # all the current descriptors         
@@ -172,4 +235,5 @@ class SuperpointTracker(FeatureTracker):
         res.kps_cur_matched = np.asarray(kps_cur[idxs_cur]) # the matched cur kps  
         res.idxs_cur = np.asarray(idxs_cur)
         
-        return res                 
+        return res
+    '''

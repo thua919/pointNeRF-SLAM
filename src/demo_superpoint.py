@@ -52,7 +52,11 @@ import time
 
 import cv2
 import torch
-#torch.cuda.set_device(3)
+
+from src import config
+cfg = config.load_config('configs/pointNeRF_slam.yaml')
+cuda_device = cfg['tracking']['device']
+torch.cuda.set_device(cuda_device)
 
 
 # Stub to warn about opencv version.
@@ -73,7 +77,7 @@ myjet = np.array([[0.        , 0.        , 0.5       ],
 
 class SuperPointNet(torch.nn.Module):
   """ Pytorch definition of SuperPoint Network. """
-  def __init__(self):
+  def __init__(self):    
     super(SuperPointNet, self).__init__()
     self.relu = torch.nn.ReLU(inplace=True)
     self.pool = torch.nn.MaxPool2d(kernel_size=2, stride=2)
@@ -130,7 +134,7 @@ class SuperPointNet(torch.nn.Module):
 class SuperPointFrontend(object):
   """ Wrapper around pytorch net to help with pre and post image processing. """
   def __init__(self, weights_path, nms_dist, conf_thresh, nn_thresh,
-               cuda=False):
+               cuda=True):
     self.name = 'SuperPoint'
     self.cuda = cuda
     self.nms_dist = nms_dist
@@ -144,11 +148,11 @@ class SuperPointFrontend(object):
     if cuda:
       # Train on GPU, deploy on GPU.
       self.net.load_state_dict(torch.load(weights_path))
-      self.net = self.net.cuda()
+      self.net = self.net.to(cuda_device)
     else:
       # Train on GPU, deploy on CPU.
-      self.net.load_state_dict(torch.load(weights_path,
-                               map_location=lambda storage, loc: storage))
+      self.net.load_state_dict(torch.load(weights_path
+                               ,map_location=lambda storage, loc: storage))
     self.net.eval()
 
   def nms_fast(self, in_corners, H, W, dist_thresh):
@@ -225,6 +229,7 @@ class SuperPointFrontend(object):
       desc - 256xN numpy array of corresponding unit normalized descriptors.
       heatmap - HxW numpy heatmap in range [0,1] of point confidences.
       """
+    img=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     assert img.ndim == 2, 'Image must be grayscale.'
     assert img.dtype == np.float32, 'Image must be float32.'
     H, W = img.shape[0], img.shape[1]
@@ -251,6 +256,7 @@ class SuperPointFrontend(object):
     heatmap = np.reshape(nodust, [Hc, Wc, self.cell, self.cell])
     heatmap = np.transpose(heatmap, [0, 2, 1, 3])
     heatmap = np.reshape(heatmap, [Hc*self.cell, Wc*self.cell])
+    
     xs, ys = np.where(heatmap >= self.conf_thresh) # Confidence threshold.
     if len(xs) == 0:
       return np.zeros((3, 0)), None, None
@@ -296,7 +302,7 @@ class PointTracker(object):
   row_m = [track_id_m, avg_desc_score_m, point_id_0_m, ..., point_id_L-1_m].
   """
 
-  def __init__(self, max_length, nn_thresh):
+  def __init__(self, max_length, nn_thresh=0.7):
     if max_length < 2:
       raise ValueError('max_length must be greater than or equal to 2.')
     self.maxl = max_length
@@ -621,6 +627,7 @@ if __name__ == '__main__':
       help='Directory where to write output frames (default: tracker_outputs/).')
   opt = parser.parse_args()
   print(opt)
+  
 
   # This class helps load input images from different sources.
   vs = VideoStreamer(opt.input, opt.camid, opt.H, opt.W, opt.skip, opt.img_glob)
@@ -711,7 +718,7 @@ if __name__ == '__main__':
       out = cv2.resize(out1, (opt.display_scale*opt.W, opt.display_scale*opt.H))
 
     # Display visualization image to screen.
-    if not opt.no_display:
+    if True:
       cv2.imshow(win, out)
       key = cv2.waitKey(opt.waitkey) & 0xFF
       if key == ord('q'):

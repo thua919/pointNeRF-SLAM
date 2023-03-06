@@ -32,7 +32,7 @@ class Parameters(object):
     
     
     # Number of desired keypoints per frame 
-    kNumFeatures=2000
+    kNumFeatures=3000
     
 
     # Point triangulation 
@@ -42,7 +42,7 @@ class Parameters(object):
     
     # Point visibility 
     kViewingCosLimitForPoint=0.5    # must be viewing cos < kViewingCosLimitForPoint (viewing angle must be less than 60 deg)
-    kScaleConsistencyFactor=1.5
+    kScaleConsistencyFactor= 1 #原来是1.5
     kMaxDistanceToleranceFactor=1.2 
     kMinDistanceToleranceFactor=0.8   
 

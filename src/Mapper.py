@@ -1,5 +1,7 @@
+import glob
 import os
-import time
+import time, threading
+rlock = threading.RLock()
 
 import cv2
 import numpy as np
@@ -11,6 +13,9 @@ from src.common import (get_camera_from_tensor, get_samples,
                         get_tensor_from_camera, random_select)
 from src.utils.datasets import get_dataset
 from src.utils.Visualizer import Visualizer
+from src.utils.utils_sys import Printer
+from tqdm import tqdm
+
 
 
 class Mapper(object):
@@ -27,8 +32,33 @@ class Mapper(object):
         self.coarse_mapper = coarse_mapper
         
         #=====================================================#
+        self.init_finished = slam.init_finished
+
         self.depth_supervision= slam.depth_supervision
         self.bundle_loss=slam.bundle_loss
+        self.camera=slam.camera
+        
+        self.frames=slam.frames
+        self.pseudo_depth_maps=slam.pseudo_depth_maps
+
+        self.depth_coord_cur=slam.depth_coord_cur
+        self.depth_coord_ref=slam.depth_coord_ref
+        self.depth_cur=slam.depth_cur
+        self.depth_ref=slam.depth_ref
+        
+        self.depth_cur_weak=slam.depth_cur_weak
+        self.depth_ref_weak=slam.depth_ref_weak
+        
+        self.weak_depth = cfg['weak_depth']
+        self.debug_tracker_sperpoint=cfg['debug_tracker_sperpoint']
+        self.track_every_frame=cfg['track_every_frame']
+        
+        self.mapper_finished = slam.mapper_finished
+        self.idx0=slam.idx0
+        
+        self.depth_0 = None
+        self.depth_every = None
+        self.depth_idx = None
         #=====================================================#
 
         self.idx = slam.idx
@@ -55,9 +85,9 @@ class Mapper(object):
         self.device = cfg['mapping']['device']
         self.fix_fine = cfg['mapping']['fix_fine']
         self.eval_rec = cfg['meshing']['eval_rec']
-        self.BA = False  # Even if BA is enabled, it starts only when there are at least 4 keyframes
+        self.BA = True  # Even if BA is enabled, it starts only when there are at least 4 keyframes
         self.BA_cam_lr = cfg['mapping']['BA_cam_lr']
-        self.mesh_freq = cfg['mapping']['mesh_freq']
+        self.mesh_freq = 50 #cfg['mapping']['mesh_freq'] # 突然传参失败，why？
         self.ckpt_freq = cfg['mapping']['ckpt_freq']
         self.fix_color = cfg['mapping']['fix_color']
         self.mapping_pixels = cfg['mapping']['pixels']
@@ -73,7 +103,7 @@ class Mapper(object):
         self.mapping_window_size = cfg['mapping']['mapping_window_size']
         self.no_vis_on_first_frame = cfg['mapping']['no_vis_on_first_frame']
         self.no_log_on_first_frame = cfg['mapping']['no_log_on_first_frame']
-        self.no_mesh_on_first_frame = cfg['mapping']['no_mesh_on_first_frame']
+        #self.no_mesh_on_first_frame = cfg['mapping']['no_mesh_on_first_frame']
         self.frustum_feature_selection = cfg['mapping']['frustum_feature_selection']
         self.keyframe_selection_method = cfg['mapping']['keyframe_selection_method']
         self.save_selected_keyframes_info = cfg['mapping']['save_selected_keyframes_info']
@@ -90,7 +120,8 @@ class Mapper(object):
             cfg, args, self.scale, device=self.device)
         self.n_img = len(self.frame_reader)
         if 'Demo' not in self.output:  # disable this visualization in demo
-            self.visualizer = Visualizer(freq=cfg['mapping']['vis_freq'], inside_freq=cfg['mapping']['vis_inside_freq'],
+            # 传参失败cfg['mapping']['vis_freq']
+            self.visualizer = Visualizer(freq=5, inside_freq=cfg['mapping']['vis_inside_freq'],
                                          vis_dir=os.path.join(self.output, 'mapping_vis'), renderer=self.renderer,
                                          verbose=self.verbose, device=self.device)
         self.H, self.W, self.fx, self.fy, self.cx, self.cy = slam.H, slam.W, slam.fx, slam.fy, slam.cx, slam.cy
@@ -167,7 +198,72 @@ class Mapper(object):
         points = points[mask]
         mask = mask.reshape(val_shape[2], val_shape[1], val_shape[0])
         return mask
+    def get_rays_from_uv(self,i, j, c2w, H, W, fx, fy, cx, cy):
+        """
+        Get corresponding rays from input uv.
 
+        """
+        if isinstance(c2w, np.ndarray):
+            c2w = torch.from_numpy(c2w).to(self.device)
+
+        dirs = torch.stack(
+            [(i-cx)/fx, -(j-cy)/fy, -torch.ones_like(i)], -1).to(self.device)
+        dirs = dirs.reshape(-1, 1, 3)
+        # Rotate ray directions from camera frame to the world frame
+        # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+        rays_d = torch.sum(dirs * c2w[:3, :3], -1)
+        rays_o = c2w[:3, -1].expand(rays_d.shape)
+        return rays_o, rays_d
+
+    def select_uv(self,i, j, n, depth, color):
+        """
+        Select n uv from dense uv.
+
+        """
+        
+        i = i.reshape(-1)
+        j = j.reshape(-1)
+        #self.depth_coord_cur
+        depth = depth.reshape(-1)
+        depth_np=depth.cpu().numpy()
+        indices=np.where(depth_np>0.01) #originallly 4
+        indices=torch.tensor(indices, device=self.device)
+        #indices = torch.randint(i.shape[0], (n,), device=self.device)
+        indices = indices.clamp(0, i.shape[0])
+        i = i[indices]  # (n)
+        j = j[indices]  # (n)
+        #depth = depth.reshape(-1)
+        color = color.reshape(-1, 3)
+        depth = depth[indices]  # (n)
+        color = color[indices]  # (n,3)
+        return i, j, depth, color
+
+
+    def get_sample_uv(self, H0, H1, W0, W1, n, depth, color):
+        """
+        Sample n uv coordinates from an image region H0..H1, W0..W1
+        """
+        depth = depth[H0:H1, W0:W1]
+        color = color[H0:H1, W0:W1]
+        i, j = torch.meshgrid(torch.linspace(
+            W0, W1-1, W1-W0).to(self.device), torch.linspace(H0, H1-1, H1-H0).to(self.device))
+        i = i.t()  # transpose
+        j = j.t()
+        i, j, depth, color = self.select_uv(i, j, n, depth, color)
+        return i, j, depth, color
+
+
+    def get_samples(self, H0, H1, W0, W1, n, H, W, fx, fy, cx, cy, c2w, depth, color):
+        """
+        Get n rays from the image region H0..H1, W0..W1.
+        c2w is its camera pose and depth/color is the corresponding image tensor.
+
+        """
+        i, j, sample_depth, sample_color = self.get_sample_uv(
+            H0, H1, W0, W1, n, depth, color)
+        rays_o, rays_d = self.get_rays_from_uv(i, j, c2w, H, W, fx, fy, cx, cy)
+        return rays_o, rays_d, sample_depth, sample_color   
+    
     def keyframe_selection_overlap(self, gt_color, gt_depth, c2w, keyframe_dict, k, N_samples=16, pixels=100):
         """
         Select overlapping keyframes to the current camera observation.
@@ -186,15 +282,19 @@ class Mapper(object):
         """
         device = self.device
         H, W, fx, fy, cx, cy = self.H, self.W, self.fx, self.fy, self.cx, self.cy
-
-        rays_o, rays_d, gt_depth, gt_color = get_samples(
+        if self.weak_depth:
+            rays_o, rays_d, gt_depth, gt_color = self.get_samples(
+            0, H, 0, W, pixels, H, W, fx, fy, cx, cy, c2w, gt_depth, gt_color)
+        else:
+            rays_o, rays_d, gt_depth, gt_color = get_samples(
             0, H, 0, W, pixels, H, W, fx, fy, cx, cy, c2w, gt_depth, gt_color, self.device)
-
+        
         gt_depth = gt_depth.reshape(-1, 1)
         gt_depth = gt_depth.repeat(1, N_samples)
         t_vals = torch.linspace(0., 1., steps=N_samples).to(device)
         near = gt_depth*0.8
         far = gt_depth+0.5
+        print("============= sample debug:near,far==========", near, far)
         z_vals = near * (1.-t_vals) + far * (t_vals)
         pts = rays_o[..., None, :] + rays_d[..., None, :] * \
             z_vals[..., :, None]  # [N_rays, N_samples, 3]
@@ -266,7 +366,7 @@ class Mapper(object):
                 num = self.mapping_window_size-2
                 #这里用random select 啊？
                 optimize_frame = random_select(len(self.keyframe_dict)-1, num)
-                # +++++++++++++++++++++++++++++++++ 我们自己的 sampling strategy 插入 +++++++++++++++++++++++++++++++++ #
+                
             elif self.keyframe_selection_method == 'overlap': # nice-slam
                 num = self.mapping_window_size-2
                 optimize_frame = self.keyframe_selection_overlap(
@@ -356,7 +456,7 @@ class Mapper(object):
         
             # imap*, single MLP (就是一开始在Nice-SLAM中load进来的东西)
         decoders_para_list += list(self.decoders.parameters())
-        '''
+        
         if self.BA:
             camera_tensor_list = []
             gt_camera_tensor_list = []
@@ -375,7 +475,7 @@ class Mapper(object):
                     camera_tensor_list.append(camera_tensor)
                     gt_camera_tensor = get_tensor_from_camera(gt_c2w)
                     gt_camera_tensor_list.append(gt_camera_tensor)
-
+            '''
         if self.nice:
             if self.BA:
                 # The corresponding lr will be set according to which stage the optimization is in
@@ -391,6 +491,7 @@ class Mapper(object):
                                               {'params': middle_grid_para, 'lr': 0},
                                               {'params': fine_grid_para, 'lr': 0},
                                               {'params': color_grid_para, 'lr': 0}])
+            '''
         else:
 
             # imap*, single MLP
@@ -398,12 +499,12 @@ class Mapper(object):
                 optimizer = torch.optim.Adam([{'params': decoders_para_list, 'lr': 0},
                                               {'params': camera_tensor_list, 'lr': 0}])
             else:
-        '''
-        optimizer = torch.optim.Adam([{'params': decoders_para_list, 'lr': 0}])
+                optimizer = torch.optim.Adam([{'params': decoders_para_list, 'lr': 0}])
+                
         from torch.optim.lr_scheduler import StepLR
         scheduler = StepLR(optimizer, step_size=200, gamma=0.8)
 
-        for joint_iter in range(num_joint_iters):
+        for joint_iter in tqdm(range(num_joint_iters)):
             '''
             if self.nice:
                 if self.frustum_feature_selection:
@@ -437,14 +538,15 @@ class Mapper(object):
             '''
             self.stage = 'color'
             optimizer.param_groups[0]['lr'] = cfg['mapping']['imap_decoders_lr']
-            '''
-                if self.BA:
-                    optimizer.param_groups[1]['lr'] = self.BA_cam_lr
-            '''    
+            
+            if self.BA:
+                optimizer.param_groups[1]['lr'] = self.BA_cam_lr
+                
 
-            if (not (idx == 0 and self.no_vis_on_first_frame)) and ('Demo' not in self.output):
-                self.visualizer.vis(
-                    idx, joint_iter, cur_gt_depth, cur_gt_color, cur_c2w, self.c, self.decoders)
+            #if (not (idx == 0 and self.no_vis_on_first_frame)) and ('Demo' not in self.output):
+            self.visualizer.vis(idx.clone().to(self.device), joint_iter, cur_gt_depth.clone().to(self.device), 
+                                cur_gt_color.clone().to(self.device), cur_c2w.clone().to(self.device), 
+                                self.c, self.decoders)
 
             optimizer.zero_grad()
             batch_rays_d_list = []
@@ -455,30 +557,43 @@ class Mapper(object):
             camera_tensor_id = 0
             for frame in optimize_frame:
                 if frame != -1:
-                    gt_depth = keyframe_dict[frame]['depth'].to(device)
+                    if self.weak_depth:
+                        gt_depth = keyframe_dict[frame]['pseudo_depth'].to(device)
+                    else:
+                        gt_depth = keyframe_dict[frame]['depth'].to(device)
+                            
                     gt_color = keyframe_dict[frame]['color'].to(device)
-                    '''
+                    
                     if self.BA and frame != oldest_frame:
                         camera_tensor = camera_tensor_list[camera_tensor_id]
                         camera_tensor_id += 1
                         c2w = get_camera_from_tensor(camera_tensor)
                     else:
-                    '''
-                    c2w = keyframe_dict[frame]['est_c2w']
+                    
+                        c2w = keyframe_dict[frame]['est_c2w']
 
                 else:
                     gt_depth = cur_gt_depth.to(device)
                     gt_color = cur_gt_color.to(device)
-                    '''
+                    
                     if self.BA:
                         camera_tensor = camera_tensor_list[camera_tensor_id]
                         c2w = get_camera_from_tensor(camera_tensor)
                     else:
-                    '''    
-                    c2w = cur_c2w
-
-                batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color = get_samples(
-                    0, H, 0, W, pixs_per_image, H, W, fx, fy, cx, cy, c2w, gt_depth, gt_color, self.device)
+                      
+                        c2w = cur_c2w
+                if self.idx==0:
+                    batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color = get_samples(
+                        0, H, 0, W, pixs_per_image, H, W, fx, fy, cx, cy, c2w, gt_depth, gt_color,device=self.device)
+                else:
+                    if self.idx >0 & self.weak_depth:
+                        batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color = self.get_samples(
+                        0, H, 0, W, pixs_per_image, H, W, fx, fy, cx, cy, c2w, gt_depth, gt_color)
+                    if self.idx >0 & self.weak_depth is not True:
+                        batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color = get_samples(
+                        0, H, 0, W, pixs_per_image, H, W, fx, fy, cx, cy, c2w, gt_depth, gt_color,device=self.device)
+                    
+                    
                 batch_rays_o_list.append(batch_rays_o.float())
                 batch_rays_d_list.append(batch_rays_d.float())
                 batch_gt_depth_list.append(batch_gt_depth.float())
@@ -506,8 +621,8 @@ class Mapper(object):
             '''
             
             ret = self.renderer.render_batch_ray(c, self.decoders, batch_rays_d,
-                                                 batch_rays_o, device, self.stage,
-                                                 gt_depth=None if self.coarse_mapper else batch_gt_depth)
+                                                 batch_rays_o, device, self.stage,batch_gt_depth)
+                                                 #gt_depth=None if self.coarse_mapper else batch_gt_depth)
             depth, uncertainty, color = ret
 
             depth_mask = (batch_gt_depth > 0)
@@ -516,7 +631,7 @@ class Mapper(object):
             if not self.depth_supervision:
                 if joint_iter == num_joint_iters-1:
                     print("self.depth_supervision:",self.depth_supervision)
-                    print("====================This Mapper is runing WITHOUT depth supervision=================")
+                    print("==================== per is runing WITHOUT depth supervision =================")
                 if ((not self.nice) or (self.stage == 'color')):
                     loss = torch.abs(batch_gt_color - color).sum()
             else:
@@ -547,7 +662,7 @@ class Mapper(object):
             optimizer.zero_grad()
 
             # put selected and updated features back to the grid
-            if self.nice and self.frustum_feature_selection:
+            '''if self.nice and self.frustum_feature_selection:
                 for key, val in c.items():
                     if (self.coarse_mapper and 'coarse' in key) or \
                             ((not self.coarse_mapper) and ('coarse' not in key)):
@@ -556,7 +671,7 @@ class Mapper(object):
                         val = val.detach()
                         val[mask] = val_grad.clone().detach()
                         c[key] = val
-        '''
+            '''
         if self.BA:
             # put the updated camera poses back
             camera_tensor_id = 0
@@ -576,114 +691,214 @@ class Mapper(object):
         if self.BA:
             return cur_c2w
         else:
-        '''
-        
-        return None
-
+            return None
+    
+    '''
+    Mapper 是被动线程
+    '''
+    
     def run(self):
-        
+        # =========================== 第一帧从frame loader中提取 ============================ #
         cfg = self.cfg
-        idx, gt_color, gt_depth, gt_c2w = self.frame_reader[0]
+        idx, gt_color, gt_depth, gt_c2w = self.frame_reader[0] #这里的idx其实很快就被下面覆盖了，意义不大
         self.estimate_c2w_list[0] = gt_c2w.cpu() # estimate_c2w_list在主线程NICE_SLAM.py被初始化
-        init = True
-        prev_idx = -1
+
+        # 一开始先初始化第一帧的keyframe，'depth': gt_depth.cpu()，在线程收到Tracker的数据后要修改成咱们的pseudo depth
+        self.keyframe_list.append(idx)
+        self.keyframe_dict.append({'gt_c2w': gt_c2w.cpu(), 'idx': idx, 'color': gt_color.cpu(
+                    ), 'depth': gt_depth.cpu(), 'est_c2w': gt_c2w.clone()})
+        
+        # =================== 开始被动循环，在while True中判断是否需要这个循环 ================ #
+        
         while (1):
+            #rlock.acquire()
+            # =============== 这个 while True:开关仅在满足条件时开启下边的优化 =============== #
             while True:
-                # 首先初始化idx为framereader读进来的第一个idx
-                idx = self.idx[0].clone()
+                idx = self.idx[0] #.clone()
+                sleep_s = 5
                 # 当：idx达到倒数第二帧 ；达到关键帧(比如设定了self.every_frame=5)；idx和prev_idx不相等
                 # 跳出循环，直接将当前的idx赋值给prev_idx
                 if idx == self.n_img-1:
                     break
-                if self.sync_method == 'strict':
-                    if idx % self.every_frame == 0 and idx != prev_idx:
-                        break
+                if self.sync_method == 'loose':
+                    idx_every=torch.tensor((self.every_frame)).int()
+                    '''
+                    下列条件满足任何一个
+                    1. 现在的.estimate_c2w_list[idx_every] 没有0
+                    2. self.depth_cur_weak 没有0
+                    3. self.depth_ref_weak 没有0
+                    4. 是非0 every frame
+                    才 break 掉 while True 循环，开始训练
+                    '''
+                    
+                    if torch.count_nonzero(self.estimate_c2w_list[idx_every]).item()!=0 and idx % self.every_frame == 0 and idx != 0: # and torch.count_nonzero(self.depth_cur_weak).item()!=0 and torch.count_nonzero(self.depth_ref_weak)!=0 and  
+                        if idx == self.every_frame:
+                            try:
+                                pseudo_depth_paths = sorted(glob.glob(f'{self.output}/pseudo_depth/*'))
+                                
+                                dpath_0=pseudo_depth_paths[0]
+                                dpath_idx=pseudo_depth_paths[1]
+                                
+                                depth_0=np.load(dpath_0)
+                                depth_every=np.load(dpath_idx)
+                                
+                                self.depth_0 = torch.from_numpy(depth_0)
+                                self.depth_every = torch.from_numpy(depth_every)
+                                Printer.green(f"===># Message from Mapper: init two .npy loaded! ")
+                                break
+                            except:
+                                Printer.yellow(f"===># Message from Mapper: Warning! .npy loading fail for init")
+                        if idx > self.every_frame:
+                            try:
+                                pseudo_depth_path = os.path.join(self.output, 'pseudo_depth',str(idx.numpy()),'.npy') 
+                                depth_idx = np.load(pseudo_depth_path)
+                                self.depth_idx = torch.from_numpy(depth_idx)
+                                break               
+                            except:
+                                Printer.yellow(f"===># Message from Mapper: Warning! .npy loading fail for {idx} frame!")        
+                        #Printer.green(f'This mapper receive self.estimate_c2w_list[idx_every] as 0, so sleep {sleep_s}s to wait Tracker')
+                        #time.sleep(sleep_s) 
+                    #if idx % self.every_frame == 0: #and idx != prev_idx:
+                    #    break
                 '''
+                if (idx % self.every_frame == 1 ): # or self.every_frame == 1
+                    while self.mapping_idx[0] != idx-1:
+                        time.sleep(0.5) 
+                
                 elif self.sync_method == 'loose':
                     if idx == 0 or idx >= prev_idx+self.every_frame//2:
                         break
                 elif self.sync_method == 'free':
                     break
                 '''
-                
-                time.sleep(0.1)
-            prev_idx = idx
+            time.sleep(0.1)
+            #prev_idx = idx
+            Printer.green(f"===># Message from Mapper: suffice criteria, Wake Up! begin a map optimization in {idx} Frame")
 
-            if self.verbose:
-                print(Fore.GREEN)
-                prefix = 'Coarse ' if self.coarse_mapper else ''
-                print(prefix+"Mapping Frame ", idx.item())
-                print(Style.RESET_ALL)
+            '''if self.verbose:
+                #print(Fore.GREEN)
+                #prefix = 'Coarse ' if self.coarse_mapper else ''
+                print("Mapping Frame ", idx.item())
+                #print(Style.RESET_ALL)'''
 
             _, gt_color, gt_depth, gt_c2w = self.frame_reader[idx]
 
-            # ================== init 在mapper线程一开始就被设置为True，所以这一块不会跑 ====================== #
-            if not init:
-                lr_factor = cfg['mapping']['lr_factor'] # 1
-                num_joint_iters = cfg['mapping']['iters'] # 300
-
-                # here provides a color refinement postprocess
-                if idx == self.n_img-1 and self.color_refine and not self.coarse_mapper:
-                    outer_joint_iters = 5
-                    self.mapping_window_size *= 2
-                    self.middle_iter_ratio = 0.0
-                    self.fine_iter_ratio = 0.0
-                    num_joint_iters *= 5
-                    self.fix_color = True
-                    self.frustum_feature_selection = False
-                else:
-                    if self.nice:
-                        outer_joint_iters = 1
-                    else:
-                        outer_joint_iters = 3
-            # ================================================================================ #                
+            # ================================= 设置优化参数 ================================== #
+            # init_finished = True
+            if not self.init_finished:
+                    outer_joint_iters = 1
+                    lr_factor = cfg['mapping']['lr_first_factor'] #5
+                    num_joint_iters = 1500#cfg['mapping']['iters_first'] #1500
             
             else:
-                outer_joint_iters = 1
-                lr_factor = cfg['mapping']['lr_first_factor'] #5
-                num_joint_iters = cfg['mapping']['iters_first'] #1500
+                if idx !=0 or idx !=self.track_every_frame:
+                    lr_factor = cfg['mapping']['lr_factor'] # 1
+                    num_joint_iters = cfg['mapping']['iters'] # 300
 
-            cur_c2w = self.estimate_c2w_list[idx].to(self.device)
+                    # here provides a color refinement postprocess
+                    if idx == self.n_img-1 and self.color_refine and not self.coarse_mapper:
+                        outer_joint_iters = 5
+                        self.mapping_window_size *= 2
+                        self.middle_iter_ratio = 0.0
+                        self.fine_iter_ratio = 0.0
+                        num_joint_iters *= 5
+                        self.fix_color = True
+                        self.frustum_feature_selection = False
+                    else:
+                        if self.nice:
+                            outer_joint_iters = 1
+                        else:
+                            outer_joint_iters = 3
+            # ================================================================================ #
+             
             num_joint_iters = num_joint_iters//outer_joint_iters
             
-            # outer_joint_iters
-            # 初始化第一帧: 1
-            # 倒数第二帧：5
-            # 其他帧：3
-            for outer_joint_iter in range(outer_joint_iters):
+            # outer_joint_iters:
+            #   初始化: 1
+            #   倒数第二帧：5
+            #   其他帧：3
+            self.mapper_finished = False            
+            for outer_joint_iter in tqdm(range(outer_joint_iters)):
+                # 初始化
+                if not self.init_finished: #idx == self.track_every_frame and
+                    #idx0=torch.zeros((1)).int()[0]
+                    while len(self.estimate_c2w_list[idx])==0 or len(self.estimate_c2w_list[self.idx0])==0:
+                        Printer.green(f'Mapper waits self.estimate_c2w_list to fill')
+                        time.sleep(sleep_s) 
+                    # 在run的一开始已经初始化了第一帧的list和dict，这里把收到的值替换一下    
+                    self.keyframe_dict[self.idx0]['pseudo_depth'] = self.depth_0.clone()
+                
+                    cur_c2w = self.estimate_c2w_list[idx].to(self.device) 
+                    self.keyframe_list.append(idx)
+                    self.keyframe_dict.append({'gt_c2w': gt_c2w.cpu(), 'idx': idx, 'color': gt_color.cpu(
+                    ), 'depth': gt_depth.cpu(), 'est_c2w': cur_c2w.clone(),'pseudo_depth': self.depth_every.clone().to(self.device)})
+                
+                if idx > self.track_every_frame and self.init_finished:
+                    while len(self.estimate_c2w_list[idx])==0:
+                            Printer.green(f'Mapper waits self.estimate_c2w_list to fill')
+                            time.sleep(sleep_s)
+                    cur_c2w = self.estimate_c2w_list[idx].to(self.device) 
+                    self.keyframe_list.append(idx)
+                    self.keyframe_dict.append({'gt_c2w': gt_c2w.cpu(), 'idx': idx, 'color': gt_color.cpu(
+                    ), 'depth': gt_depth.cpu(), 'est_c2w': cur_c2w.clone(),'pseudo_depth':self.depth_idx.clone()})
+                    
+                '''else:
+                    # add new frame to keyframe set
+                    # 到准备get out iteration的时候，查询当前帧是否满足关键帧定义并加入
+                    if outer_joint_iter == outer_joint_iters-1 and init_ok:
+                        if (idx % self.keyframe_every == 0 or (idx == self.n_img-2)) \
+                            and (idx not in self.keyframe_list):
+                                
+                            self.keyframe_list.append(idx)
+                            self.keyframe_dict.append({'gt_c2w': gt_c2w.cpu(), 'idx': idx, 'color': gt_color.cpu(
+                            ), 'depth': gt_depth.cpu(), 'est_c2w': cur_c2w.clone()})
+                    if idx==0:
+                        break'''
+                    
                 #imap self.BA是设为False，而nice-slam是True
-                '''
                 self.BA = (len(self.keyframe_list) > 4) and cfg['mapping']['BA'] and (
                     not self.coarse_mapper) 
-                '''
+                
                 # optimize_map返回 cur_c2w/None (tensor/None)，如果没BA就啥都不返回 
                 # imap 就是关闭了BA，所以不返回更新的pose，只更新mapping
                 # then optimize scene representation and camera poses(if local BA enabled).
-
-                _ = self.optimize_map(num_joint_iters, lr_factor, idx, gt_color, gt_depth,
+                if self.weak_depth and not self.init_finished: #& (idx == self.track_every_frame).sum() and not self.depth_cur_weak.sum():
+                    #gt_depth=self.depth_cur_weak
+                    print('============= sanity check self.keyframe_dict for idx 0,5 ===========:::',
+                          self.keyframe_dict[0],
+                          self.keyframe_dict[-1])
+                    _ = self.optimize_map(num_joint_iters, lr_factor, idx, gt_color, gt_depth,
                                       gt_c2w, self.keyframe_dict, self.keyframe_list, cur_c2w=cur_c2w)
-                '''
+                    
+                    self.init_finished = True
+                    break 
+                                
+                if self.weak_depth & idx>self.track_every_frame:
+                    #gt_depth=self.depth_cur_weak
+                    _ = self.optimize_map(num_joint_iters, lr_factor, idx, gt_color, gt_depth,
+                                      gt_c2w, self.keyframe_dict, self.keyframe_list, cur_c2w=cur_c2w)
+
+                else:    
+                    _ = self.optimize_map(num_joint_iters, lr_factor, idx, gt_color, gt_depth,
+                                      gt_c2w, self.keyframe_dict, self.keyframe_list, cur_c2w=cur_c2w)
+                
                 if self.BA:
                     cur_c2w = _
                     self.estimate_c2w_list[idx] = cur_c2w
-                '''
-                # add new frame to keyframe set
-                # 到准备get out iteration的时候，查询当前帧是否满足关键帧定义并加入
-                if outer_joint_iter == outer_joint_iters-1:
-                    if (idx % self.keyframe_every == 0 or (idx == self.n_img-2)) \
-                            and (idx not in self.keyframe_list):
-                        self.keyframe_list.append(idx)
-                        self.keyframe_dict.append({'gt_c2w': gt_c2w.cpu(), 'idx': idx, 'color': gt_color.cpu(
-                        ), 'depth': gt_depth.cpu(), 'est_c2w': cur_c2w.clone()})
+            
 
             if self.low_gpu_mem:
                 torch.cuda.empty_cache()
-            init = False
+            
+            # 设置了一个通讯开关
+            self.mapper_finished = True  
             
             # mapping of first frame is done, can begin tracking（在NICE_SLAM.py 的主线程中tracking就是在等他）
             self.mapping_first_frame[0] = 1
             
             # mapping 构造函数在一开始就把coarse写False了
+            # ====================================== 输出mesh的逻辑 ======================================== #
+            Printer.yellow(f'===> Message from Mapper: The mesh is creating, curent idx is {idx}')
             if not self.coarse_mapper:
                 if ((not (idx == 0 and self.no_log_on_first_frame)) and idx % self.ckpt_freq == 0) \
                         or idx == self.n_img-1:
@@ -694,7 +909,7 @@ class Mapper(object):
                 self.mapping_idx[0] = idx
                 self.mapping_cnt[0] += 1
 
-                if (idx % self.mesh_freq == 0) and (not (idx == 0 and self.no_mesh_on_first_frame)):
+                if (idx % self.mesh_freq == 0) and (not (idx == 0)): #and self.no_mesh_on_first_frame)):
                     mesh_out_file = f'{self.output}/mesh/{idx:05d}_mesh.ply'
                     self.mesher.get_mesh(mesh_out_file, self.c, self.decoders, self.keyframe_dict, self.estimate_c2w_list,
                                          idx,  self.device, show_forecast=self.mesh_coarse_level,
@@ -713,6 +928,7 @@ class Mapper(object):
                                              self.estimate_c2w_list, idx, self.device, show_forecast=False,
                                              clean_mesh=self.clean_mesh, get_mask_use_all_frames=True)
                     break
-
+            # ============================================================================================= #
             if idx == self.n_img-1:
                 break
+            #rlock.release()

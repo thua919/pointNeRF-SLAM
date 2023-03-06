@@ -76,7 +76,7 @@ class SuperPointFeature2D:
         print(self.opts)        
         
         print('SuperPointFeature2D')
-        print('==> Loading pre-trained network.')
+        #print('==> Loading pre-trained network.')
         # This class runs the SuperPoint network and processes its outputs.
         self.fe = SuperPointFrontend(weights_path=self.opts.weights_path,
                                 nms_dist=self.opts.nms_dist,
@@ -91,21 +91,31 @@ class SuperPointFeature2D:
         self.heatmap = [] 
         self.frame = None 
         self.frameFloat = None 
-        self.keypoint_size = 20  # just a representative size for visualization and in order to convert extracted points to cv2.KeyPoint 
+        self.keypoint_size = 40  # just a representative size for visualization and in order to convert extracted points to cv2.KeyPoint 
           
     # compute both keypoints and descriptors       
     def detectAndCompute(self, frame, mask=None):  # mask is a fake input 
         with self.lock: 
             self.frame = frame 
             self.frameFloat  = (frame.astype('float32') / 255.)
+            
+            # ============ run函数就是demo_superpoint里的本run ============= #
             self.pts, self.des, self.heatmap = self.fe.run(self.frameFloat)
+            # ============================================================= #
+            
             # N.B.: pts are - 3xN numpy array with corners [x_i, y_i, confidence_i]^T.
             #print('pts: ', self.pts.T)
             self.kps = convert_superpts_to_keypoints(self.pts.T, size=self.keypoint_size)
             if kVerbose:
                 print('detector: SUPERPOINT, #features: ', len(self.kps), ', frame res: ', frame.shape[0:2])      
-            return self.kps, transpose_des(self.des)                 
-            
+            return self.kps, transpose_des(self.des)                
+
+
+
+
+
+
+    '''
     # return keypoints if available otherwise call detectAndCompute()    
     def detect(self, frame, mask=None):  # mask is a fake input  
         with self.lock:         
@@ -120,4 +130,4 @@ class SuperPointFeature2D:
                 Printer.orange('WARNING: SUPERPOINT is recomputing both kps and des on last input frame', frame.shape)
                 self.detectAndCompute(frame)
             return self.kps, transpose_des(self.des)
-           
+    '''       
